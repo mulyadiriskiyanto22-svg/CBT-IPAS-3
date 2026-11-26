@@ -1,0 +1,526 @@
+<script>
+    // TEMPELKAN URL WEB APP APPS SCRIPT ANDA DI SINI:
+    const API_URL = 'https://script.google.com/macros/s/AKfycbyBHOvHuas_VItL2eXBfcJ22ItfSuaVwIDrtfBJ7pIaR5cIgeRpMjbFGIyQ3KaiaeDJTg/exec';
+
+    // Helper Komunikasi ke Google Sheets API (Bebas CORS preflight)
+    async function callAPI(dataObj) {
+      const response = await fetch(API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/plain;charset=utf-8'
+        },
+        body: JSON.stringify(dataObj)
+      });
+      if (!response.ok) {
+        throw new Error('Gagal terhubung ke server database (' + response.status + ')');
+      }
+      return await response.json();
+    }
+
+    // State Aplikasi
+    let state = {
+      peserta: null,
+      config: null,
+      percobaanKe: 1,
+      logRowIndex: 0,
+      soalList: [],
+      currentIndex: 0,
+      jawaban: {},
+      ujianAktif: false,
+      pelanggaran: 0,
+      maksPelanggaran: 3,
+      lastViolationTime: 0,
+      timerInterval: null,
+      camWatchInterval: null,
+      mediaStream: null,
+      sisaDetik: 5400,
+      sedangSubmit: false
+    };
+
+    /* ================= 1. LOGIN & BRIEFING ================= */
+    async function prosesLogin() {
+      const u = document.getElementById('username').value.trim();
+      const p = document.getElementById('password').value.trim();
+      const errBox = document.getElementById('login-error');
+      const btn = document.getElementById('btn-login');
+
+      if (!u || !p) {
+        errBox.textContent = 'Harap isi Username dan Password CBT.';
+        errBox.classList.remove('hidden');
+        return;
+      }
+
+      errBox.classList.add('hidden');
+      btn.disabled = true;
+      btn.textContent = 'Memverifikasi Akun...';
+
+      try {
+        const res = await callAPI({ action: 'login', username: u, password: p });
+        btn.disabled = false;
+        btn.textContent = 'Masuk ke Ruang Ujian';
+
+        if (!res.success) {
+          errBox.textContent = res.message;
+          errBox.classList.remove('hidden');
+          return;
+        }
+
+        state.peserta = res.peserta;
+        state.config = res.config;
+        state.percobaanKe = res.percobaanKe;
+
+        document.getElementById('brief-nama').textContent = `Halo, ${res.peserta.namaLengkap}`;
+        document.getElementById('brief-detail').textContent = `ID Peserta: ${res.peserta.idPeserta} • Rombel: ${res.peserta.rombel}`;
+        document.getElementById('brief-attempt').textContent = res.percobaanKe;
+        document.getElementById('brief-sisa').textContent = res.sisaPercobaan;
+
+        document.getElementById('screen-login').classList.add('hidden');
+        document.getElementById('screen-briefing').classList.remove('hidden');
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = 'Masuk ke Ruang Ujian';
+        errBox.textContent = 'Gagal terhubung ke server: ' + err.message;
+        errBox.classList.remove('hidden');
+      }
+    }
+
+    async function aktifkanKameraAwal() {
+      const msg = document.getElementById('cam-check-msg');
+      const videoPreview = document.getElementById('preview-cam');
+      const btnMulai = document.getElementById('btn-mulai');
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 320, height: 240, facingMode: 'user' },
+          audio: false
+        });
+        state.mediaStream = stream;
+        videoPreview.srcObject = stream;
+        msg.style.color = '#16a34a';
+        msg.textContent = '✅ Kamera aktif! Anda siap memulai ujian.';
+        btnMulai.disabled = false;
+      } catch (err) {
+        msg.style.color = '#dc2626';
+        msg.textContent = '❌ Izin kamera ditolak/tidak ditemukan. Kamera wajib aktif untuk mengikuti ujian!';
+        btnMulai.disabled = true;
+      }
+    }
+
+    /* ================= 2. MULAI UJIAN & ANTI-CHEAT ================= */
+    async function mulaiUjian() {
+      if (!state.mediaStream || !state.mediaStream.active) {
+        alert('Kamera wajib aktif terlebih dahulu sebelum memulai ujian!');
+        return;
+      }
+
+      const btn = document.getElementById('btn-mulai');
+      btn.disabled = true;
+      btn.textContent = 'Menyiapkan Soal & Mengatur Status Berlangsung...';
+
+      masukFullscreen();
+
+      try {
+        const res = await callAPI({
+          action: 'mulai',
+          idPeserta: state.peserta.idPeserta,
+          namaLengkap: state.peserta.namaLengkap
+        });
+
+        if (!res.success) {
+          alert(res.message);
+          btn.disabled = false;
+          btn.textContent = 'Mulai Mengerjakan Ujian';
+          return;
+        }
+
+        state.logRowIndex = res.logRowIndex;
+        state.percobaanKe = res.percobaanKe;
+        state.soalList = res.soal;
+        state.sisaDetik = (res.durasiMenit || 90) * 60;
+        state.ujianAktif = true;
+
+        const liveVideo = document.getElementById('webcam-video');
+        liveVideo.srcObject = state.mediaStream;
+        document.getElementById('webcam-box').style.display = 'block';
+
+        buatWatermark();
+
+        document.getElementById('hdr-nama').textContent = state.peserta.namaLengkap;
+        document.getElementById('hdr-info').textContent =
+          `${state.peserta.idPeserta} • Percobaan ke-${state.percobaanKe} • Status Database: BERLANGSUNG`;
+
+        document.getElementById('screen-briefing').classList.add('hidden');
+        document.getElementById('screen-exam').classList.remove('hidden');
+
+        renderNavigasi();
+        renderSoal(0);
+        mulaiTimer();
+        // Beri jeda 2 detik sebelum anti-cheat aktif agar transisi fullscreen stabil
+        setTimeout(aktifkanProteksiAntiCurang, 2000);
+      } catch (err) {
+        alert('Terjadi kesalahan: ' + err.message);
+        btn.disabled = false;
+        btn.textContent = 'Mulai Mengerjakan Ujian';
+      }
+    }
+
+    function buatWatermark() {
+      const wm = document.getElementById('watermark-layer');
+      wm.style.display = 'flex';
+      const teks = `${state.peserta.idPeserta} - ${state.peserta.namaLengkap} - CBT IPAS VI`;
+      let html = '';
+      for (let i = 0; i < 24; i++) {
+        html += `<div class="wm-item">${teks}</div>`;
+      }
+      wm.innerHTML = html;
+    }
+
+    function masukFullscreen() {
+      const el = document.documentElement;
+      if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    }
+
+    function aktifkanProteksiAntiCurang() {
+      document.addEventListener('contextmenu', e => {
+        if (state.ujianAktif) e.preventDefault();
+      });
+
+      ['copy', 'cut', 'paste', 'dragstart'].forEach(evt => {
+        document.addEventListener(evt, e => {
+          if (state.ujianAktif) e.preventDefault();
+        });
+      });
+
+      document.addEventListener('keydown', e => {
+        if (!state.ujianAktif) return;
+
+        if (e.key === 'PrintScreen') {
+          e.preventDefault();
+          if (navigator.clipboard) navigator.clipboard.writeText('').catch(() => {});
+          catatPelanggaran('Terdeteksi menekan tombol PrintScreen (Screenshot)!');
+        }
+
+        const ctrlOrMeta = e.ctrlKey || e.metaKey;
+        const forbiddenKeys = ['c', 'v', 'x', 'p', 's', 'u', 'a'];
+        if (
+          e.key === 'F12' ||
+          (ctrlOrMeta && forbiddenKeys.includes(e.key.toLowerCase())) ||
+          (ctrlOrMeta && e.shiftKey && ['i', 'j', 'c'].includes(e.key.toLowerCase()))
+        ) {
+          e.preventDefault();
+          catatPelanggaran(`Shortcut terlarang terdeteksi (${e.key.toUpperCase()})!`);
+        }
+      });
+
+      document.addEventListener('visibilitychange', () => {
+        if (state.ujianAktif && document.hidden) {
+          catatPelanggaran('Terdeteksi berpindah tab atau meminimalkan jendela browser!');
+        }
+      });
+
+      window.addEventListener('blur', () => {
+        if (state.ujianAktif && !state.sedangSubmit) {
+          catatPelanggaran('Jendela ujian kehilangan fokus (membuka aplikasi lain / Snipping Tool)!');
+        }
+      });
+
+      document.addEventListener('fullscreenchange', () => {
+        if (state.ujianAktif && !document.fullscreenElement && !state.sedangSubmit) {
+          catatPelanggaran('Keluar dari mode Layar Penuh (Fullscreen)!');
+        }
+      });
+
+      state.camWatchInterval = setInterval(() => {
+        if (!state.ujianAktif) return;
+        const track = state.mediaStream && state.mediaStream.getVideoTracks()[0];
+        if (!track || track.readyState !== 'live' || !track.enabled) {
+          catatPelanggaran('Kamera pengawas dimatikan atau terputus saat ujian berlangsung!');
+        }
+      }, 3000);
+    }
+
+    function catatPelanggaran(alasan) {
+      if (!state.ujianAktif || state.sedangSubmit) return;
+
+      // Cooldown 2.5 detik agar kejadian bersamaan (misal blur + fullscreen) tidak dihitung 2x
+      const now = Date.now();
+      if (now - state.lastViolationTime < 2500) return;
+      state.lastViolationTime = now;
+
+      state.pelanggaran++;
+      document.getElementById('hdr-pelanggaran').textContent = state.pelanggaran;
+
+      if (state.pelanggaran >= state.maksPelanggaran) {
+        document.getElementById('privacy-shield').style.display = 'none';
+        alert(`PELANGGARAN KE-${state.pelanggaran}: ${alasan}\n\nBatas pelanggaran terlampaui! Ujian Anda otomatis dikumpulkan.`);
+        kumpulkanUjian('Auto-Submit Pelanggaran');
+        return;
+      }
+
+      document.getElementById('shield-reason').textContent = alasan;
+      document.getElementById('shield-counter').textContent =
+        `Peringatan Pelanggaran ke-${state.pelanggaran} dari ${state.maksPelanggaran}. Jika mencapai 3 kali, ujian otomatis ditutup!`;
+      document.getElementById('privacy-shield').style.display = 'flex';
+    }
+
+    function kembaliKeUjian() {
+      document.getElementById('privacy-shield').style.display = 'none';
+      masukFullscreen();
+    }
+
+    /* ================= 3. TIMER & RENDER SOAL ================= */
+    function mulaiTimer() {
+      state.timerInterval = setInterval(() => {
+        if (!state.ujianAktif) return;
+        state.sisaDetik--;
+
+        const m = Math.floor(state.sisaDetik / 60);
+        const s = state.sisaDetik % 60;
+        const display = document.getElementById('timer-display');
+        display.textContent = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+
+        if (state.sisaDetik <= 300) {
+          display.style.color = '#ef4444';
+        }
+
+        if (state.sisaDetik <= 0) {
+          clearInterval(state.timerInterval);
+          alert('Waktu pengerjaan telah habis! Jawaban Anda otomatis dikumpulkan.');
+          kumpulkanUjian('Waktu Habis');
+        }
+      }, 1000);
+    }
+
+    function getQKey(noUrut) {
+      return 'Q' + String(noUrut).padStart(2, '0');
+    }
+
+    function isSoalTerjawab(soal) {
+      const qKey = getQKey(soal.noUrut);
+      const ans = state.jawaban[qKey];
+      if (!ans) return false;
+      if (soal.tipeSoal === 'PG') return String(ans).trim() !== '';
+      if (soal.tipeSoal === 'PGK_MCMA') return Array.isArray(ans) && ans.length > 0;
+      if (soal.tipeSoal === 'BS_PAKET') return ans.P1 && ans.P2 && ans.P3;
+      return false;
+    }
+
+    function renderNavigasi() {
+      const grid = document.getElementById('nav-soal-grid');
+      grid.innerHTML = '';
+      state.soalList.forEach((s, idx) => {
+        const btn = document.createElement('button');
+        btn.className = 'nav-btn';
+        if (isSoalTerjawab(s)) btn.classList.add('answered');
+        if (idx === state.currentIndex) btn.classList.add('active');
+        btn.textContent = s.noUrut;
+        btn.onclick = () => renderSoal(idx);
+        grid.appendChild(btn);
+      });
+    }
+
+    function renderSoal(idx) {
+      state.currentIndex = idx;
+      const s = state.soalList[idx];
+      const qKey = getQKey(s.noUrut);
+
+      document.getElementById('soal-nomor-badge').textContent = `Soal No. ${s.noUrut} dari ${state.soalList.length}`;
+
+      const labelTipe = {
+        'PG': 'Pilihan Ganda (Pilih 1 Jawaban)',
+        'PGK_MCMA': 'PG Kompleks (Pilih Lebih Dari 1 Jawaban Benar)',
+        'BS_PAKET': 'Paket Benar / Salah (3 Pernyataan)'
+      };
+      document.getElementById('soal-tipe-badge').textContent = labelTipe[s.tipeSoal] || s.tipeSoal;
+
+      const stimBox = document.getElementById('soal-stimulus');
+      if (s.stimulus && s.stimulus !== 'Tanpa Gambar' && s.stimulus !== '-') {
+        stimBox.textContent = s.stimulus;
+        stimBox.classList.remove('hidden');
+      } else {
+        stimBox.classList.add('hidden');
+      }
+
+      const imgWrap = document.getElementById('soal-gambar-wrap');
+      const imgEl = document.getElementById('soal-gambar');
+      if (s.imageUrl) {
+        imgEl.src = s.imageUrl;
+        imgWrap.classList.remove('hidden');
+      } else {
+        imgWrap.classList.add('hidden');
+      }
+
+      document.getElementById('soal-pertanyaan').textContent = s.pertanyaan;
+
+      const opsiContainer = document.getElementById('soal-opsi-container');
+      opsiContainer.innerHTML = '';
+
+      if (s.tipeSoal === 'PG') {
+        const pilihan = [
+          { kode: 'A', teks: s.opsiA },
+          { kode: 'B', teks: s.opsiB },
+          { kode: 'C', teks: s.opsiC },
+          { kode: 'D', teks: s.opsiD }
+        ];
+        pilihan.forEach(p => {
+          const selected = state.jawaban[qKey] === p.kode;
+          const div = document.createElement('div');
+          div.className = 'option-item' + (selected ? ' selected' : '');
+          div.innerHTML = `<input type="radio" name="${qKey}" ${selected ? 'checked' : ''}> <span><strong>${p.kode}.</strong> ${p.teks}</span>`;
+          div.onclick = () => {
+            state.jawaban[qKey] = p.kode;
+            renderSoal(idx);
+          };
+          opsiContainer.appendChild(div);
+        });
+      } else if (s.tipeSoal === 'PGK_MCMA') {
+        const currentArr = Array.isArray(state.jawaban[qKey]) ? state.jawaban[qKey] : [];
+        const pilihan = [
+          { kode: 'A', teks: s.opsiA },
+          { kode: 'B', teks: s.opsiB },
+          { kode: 'C', teks: s.opsiC },
+          { kode: 'D', teks: s.opsiD }
+        ];
+        pilihan.forEach(p => {
+          const checked = currentArr.includes(p.kode);
+          const div = document.createElement('div');
+          div.className = 'option-item' + (checked ? ' selected' : '');
+          div.innerHTML = `<input type="checkbox" ${checked ? 'checked' : ''}> <span><strong>${p.kode}.</strong> ${p.teks}</span>`;
+          div.onclick = () => {
+            let updated = [...currentArr];
+            if (updated.includes(p.kode)) {
+              updated = updated.filter(x => x !== p.kode);
+            } else {
+              updated.push(p.kode);
+            }
+            state.jawaban[qKey] = updated.sort();
+            renderSoal(idx);
+          };
+          opsiContainer.appendChild(div);
+        });
+      } else if (s.tipeSoal === 'BS_PAKET') {
+        const currentBS = state.jawaban[qKey] || {};
+        const pernyataanList = [
+          { kode: 'P1', teks: s.opsiA },
+          { kode: 'P2', teks: s.opsiB },
+          { kode: 'P3', teks: s.opsiC }
+        ];
+
+        let tableHTML = `
+          <table class="bs-table">
+            <thead>
+              <tr>
+                <th>Pernyataan</th>
+                <th>BENAR</th>
+                <th>SALAH</th>
+              </tr>
+            </thead>
+            <tbody>
+        `;
+        pernyataanList.forEach(p => {
+          const val = currentBS[p.kode] || '';
+          tableHTML += `
+            <tr>
+              <td>${p.teks}</td>
+              <td class="center">
+                <input type="radio" name="${qKey}_${p.kode}" ${val === 'BENAR' ? 'checked' : ''}
+                  onchange="pilihBS('${qKey}', '${p.kode}', 'BENAR')">
+              </td>
+              <td class="center">
+                <input type="radio" name="${qKey}_${p.kode}" ${val === 'SALAH' ? 'checked' : ''}
+                  onchange="pilihBS('${qKey}', '${p.kode}', 'SALAH')">
+              </td>
+            </tr>
+          `;
+        });
+        tableHTML += `</tbody></table>`;
+        opsiContainer.innerHTML = tableHTML;
+      }
+
+      document.getElementById('btn-prev').disabled = idx === 0;
+      document.getElementById('btn-next').disabled = idx === state.soalList.length - 1;
+      renderNavigasi();
+    }
+
+    function pilihBS(qKey, pKode, nilai) {
+      if (!state.jawaban[qKey]) state.jawaban[qKey] = {};
+      state.jawaban[qKey][pKode] = nilai;
+      renderNavigasi();
+    }
+
+    function gantiSoal(step) {
+      const nextIdx = state.currentIndex + step;
+      if (nextIdx >= 0 && nextIdx < state.soalList.length) {
+        renderSoal(nextIdx);
+      }
+    }
+
+    /* ================= 4. SUBMIT & SINKRONISASI ================= */
+    function konfirmasiKumpulkan() {
+      const terjawab = state.soalList.filter(s => isSoalTerjawab(s)).length;
+      const total = state.soalList.length;
+      const pesan = terjawab < total
+        ? `Anda baru menjawab ${terjawab} dari ${total} soal. Yakin ingin mengumpulkan ujian sekarang?`
+        : `Semua soal (${total} butir) sudah terjawab. Kumpulkan ujian sekarang?`;
+
+      if (confirm(pesan)) {
+        kumpulkanUjian('Selesai');
+      }
+    }
+
+    async function kumpulkanUjian(alasanSelesai) {
+      if (state.sedangSubmit) return;
+      state.sedangSubmit = true;
+      state.ujianAktif = false;
+
+      clearInterval(state.timerInterval);
+      clearInterval(state.camWatchInterval);
+
+      const btnSubmit = document.getElementById('btn-kumpulkan');
+      btnSubmit.disabled = true;
+      btnSubmit.textContent = 'Menyimpan & Menyinkronkan Nilai...';
+
+      const payload = {
+        idPeserta: state.peserta.idPeserta,
+        namaLengkap: state.peserta.namaLengkap,
+        percobaanKe: state.percobaanKe,
+        logRowIndex: state.logRowIndex,
+        jawaban: state.jawaban,
+        alasanSelesai: alasanSelesai
+      };
+
+      try {
+        const res = await callAPI({ action: 'submit', payload: payload });
+
+        if (state.mediaStream) {
+          state.mediaStream.getTracks().forEach(t => t.stop());
+        }
+        document.getElementById('webcam-box').style.display = 'none';
+        document.getElementById('watermark-layer').style.display = 'none';
+        if (document.fullscreenElement) {
+          document.exitFullscreen().catch(() => {});
+        }
+
+        if (!res.success) {
+          alert('Peringatan saat menyimpan: ' + res.message);
+          return;
+        }
+
+        document.getElementById('res-nama').textContent =
+          `${state.peserta.namaLengkap} (${state.peserta.idPeserta}) • Percobaan ke-${res.percobaanKe}`;
+        document.getElementById('res-nilai-ini').textContent = res.nilaiAkhir;
+        document.getElementById('res-skor-ini').textContent = `Skor Perolehan: ${res.totalSkor} / ${res.skorMaks}`;
+        document.getElementById('res-nilai-max').textContent = res.nilaiTertinggi;
+        document.getElementById('res-kktp').textContent = `Status KKTP: ${res.statusKKTP}`;
+
+        document.getElementById('screen-exam').classList.add('hidden');
+        document.getElementById('screen-result').classList.remove('hidden');
+      } catch (err) {
+        state.sedangSubmit = false;
+        btnSubmit.disabled = false;
+        btnSubmit.textContent = '✅ Selesai & Kumpulkan';
+        alert('Gagal mengirim jawaban ke server: ' + err.message);
+      }
+    }
+  </script>
